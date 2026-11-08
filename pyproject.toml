@@ -11,4 +11,4 @@ requires-python = ">=3.10"
 dependencies = []
 
 [tool.setuptools.packages.find]
-include = ["travel_tech_case*"]
+include = ["core*"]
