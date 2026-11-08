@@ -40,7 +40,7 @@ class RulesEngine:
                     kind=DisruptionKind.CANCELLATION,
                     replace_segment_id=a.id,
                     not_before=a.depart,
-                    detail=f"рейс {a.flight_no} отменён",
+                    detail=f"flight {a.flight_no} cancelled",
                 ))
                 continue
 
@@ -60,7 +60,7 @@ class RulesEngine:
                 kind=DisruptionKind.MISSED_CONNECTION,
                 replace_segment_id=b.id,
                 not_before=earliest,
-                detail=f"пересадка в {a.destination} между {a.flight_no} и {b.flight_no}: {gap} мин при MCT {mct} мин",
+                detail=f"connection in {a.destination} between {a.flight_no} and {b.flight_no}: {gap} min, MCT {mct} min",
             ))
 
         return result
@@ -77,7 +77,7 @@ class RulesEngine:
             if segment.confidence == Confidence.LOW:
                 await notify_participants(
                     self.__bus, trip, key_base, Severity.INFO,
-                    f"Возможна задержка рейса {segment.flight_no} (~{segment.delay_minutes} мин), данные не подтверждены — уточняем.",
+                    f"Possible delay of {segment.flight_no} (~{segment.delay_minutes} min), unconfirmed — checking.",
                 )
                 continue
 
@@ -88,8 +88,8 @@ class RulesEngine:
                 if segment.status == FlightStatus.DELAYED and segment.delay_minutes >= self.min_reported_delay:
                     await notify_participants(
                         self.__bus, trip, key_base, Severity.INFO,
-                        f"Рейс {segment.flight_no} задерживается на {segment.delay_minutes} мин, "
-                        f"прилёт {local_time(segment.actual_arrive, segment.destination)}. Стыковки не пострадали.",
+                        f"{segment.flight_no} is delayed by {segment.delay_minutes} min, "
+                        f"arrival {local_time(segment.actual_arrive, segment.destination)}. Connections are fine.",
                     )
                 continue
 
@@ -97,9 +97,9 @@ class RulesEngine:
                 if disruption.id in self.__seen: continue
                 self.__seen.add(disruption.id)
 
-                log("rules", f"ДИСТРАПШН ({disruption.kind.value}): {disruption.detail}")
+                log("rules", f"DISRUPTION ({disruption.kind.value}): {disruption.detail}")
                 await notify_participants(
                     self.__bus, trip, f"{disruption.id}:alert", Severity.CRITICAL,
-                    f"Проблема в поездке: {disruption.detail}. Подбираем альтернативы.",
+                    f"Trip problem: {disruption.detail}. Searching alternatives.",
                 )
                 await self.__bus.publish(Topics.TRIP_DISRUPTED, disruption.id, disruption)

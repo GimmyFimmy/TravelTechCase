@@ -44,7 +44,7 @@ class MockFlightAdapter(FlightAdapter):
 
     async def fetch(self, flight_no: str, date: datetime) -> RawFlightUpdate:
         queue = self.__script.get(flight_no)
-        if not queue: raise LookupError(f"нет данных по рейсу {flight_no}")
+        if not queue: raise LookupError(f"no data for flight {flight_no}")
 
         item = queue.pop(0) if len(queue) > 1 else queue[0]
         if isinstance(item, Exception): raise item
@@ -92,7 +92,7 @@ class FlightTrackerService:
 
         # data arrives late and out of order: an older observation must not overwrite a newer one
         if raw.observed_at < known.observed_at:
-            return log("tracker", f"{known.flight_no}: устаревшее наблюдение отброшено")
+            return log("tracker", f"{known.flight_no}: stale observation dropped")
 
         update = self.__normalize(known, raw)
 
@@ -100,11 +100,11 @@ class FlightTrackerService:
         upgraded = update.confidence > known.confidence
         if update.fingerprint == known.fingerprint and not upgraded:
             if update.status != FlightStatus.SCHEDULED:
-                log("tracker", f"{known.flight_no}: дубликат ({update.fingerprint}, {update.confidence.name.lower()}) отброшен")
+                log("tracker", f"{known.flight_no}: duplicate ({update.fingerprint}, {update.confidence.name.lower()}) dropped")
             return
 
         self.__known[segment_id] = update
-        log("tracker", f"{update.flight_no}: {update.status.value} +{update.delay_minutes} мин, confidence={update.confidence.name.lower()}")
+        log("tracker", f"{update.flight_no}: {update.status.value} +{update.delay_minutes} min, confidence={update.confidence.name.lower()}")
 
         await self.__bus.publish(
             Topics.FLIGHT_STATUS_CHANGED,

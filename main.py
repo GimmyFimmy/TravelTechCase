@@ -45,7 +45,7 @@ def describe_trip(trip: Trip) -> str:
             f"[{s.status.value} +{s.delay_minutes}]"
         )
     for item in trip.items:
-        lines.append(f"  • {item.title} {hhmm(item.start)}Z{'  ⚠ под угрозой' if item.at_risk else ''}")
+        lines.append(f"  • {item.title} {hhmm(item.start)}Z{'  ⚠ at risk' if item.at_risk else ''}")
 
     return "\n".join(lines)
 
@@ -142,43 +142,43 @@ async def main() -> None:
 
     tracker.track(trips.require("t1").segments)
 
-    section("исходный план")
+    section("initial plan")
     print(describe_trip(trips.require("t1")))
 
-    section("poll 1: таймаут → retry → рассылка (low confidence)")
+    section("poll 1: timeout → retry → mailing (low confidence)")
     await tracker.poll()
 
-    section("poll 2: API подтвердило задержку (high confidence) → дистрапшн → альтернативы → переоформление")
+    section("poll 2: API confirms the delay (high confidence) → disruption → alternatives → rebook")
     await tracker.poll()
 
-    section("poll 3: тот же статус ещё раз → дедупликация")
+    section("poll 3: same status again → dedup")
     await tracker.poll()
 
-    section("poll 4: API лежит → breaker открывается → fallback на последний известный статус")
+    section("poll 4: API down → breaker opens → fallback to last known status")
     await tracker.poll()
-    print(f"breaker flight-api: {api_breaker.state.value}, DLQ опросов: {len(tracker.dead_letters)}")
+    print(f"breaker flight-api: {api_breaker.state.value}, poll DLQ: {len(tracker.dead_letters)}")
 
-    section("итоговый план")
+    section("final plan")
     print(describe_trip(trips.require("t1")))
 
-    section("повторная доставка того же события (идемпотентность)")
-    duplicate = NotificationRequest(key="k1", user_id="u1", trip_id="t1", severity=Severity.INFO, text="тест")
+    section("re-delivery of the same event (idempotency)")
+    duplicate = NotificationRequest(key="k1", user_id="u1", trip_id="t1", severity=Severity.INFO, text="test")
     await bus.publish(Topics.NOTIF_REQUESTED, "t1:rebooked-dup", duplicate)
     await bus.publish(Topics.NOTIF_REQUESTED, "t1:rebooked-dup", duplicate)
 
-    section("оффлайн: u2 открывает приложение и синхронизируется")
+    section("offline: u2 opens the app and syncs")
     device = DeviceCache("u2")
     device.sync_from(notifications)
     device.sync_from(notifications)
 
-    section("роли и оптимистичная блокировка")
-    extra = PlanItem("a3", "Ужин", utc(2026, 11, 11, 18, 0), utc(2026, 11, 11, 20, 0))
+    section("roles and optimistic locking")
+    extra = PlanItem("a3", "Dinner", utc(2026, 11, 11, 18, 0), utc(2026, 11, 11, 20, 0))
     version = trips.require("t1").version
 
     for label, user_id, expected_version in [
         ("viewer u2", "u2", version),
-        ("u1 со старой версией", "u1", version - 1),
-        ("u1 с актуальной версией", "u1", version),
+        ("u1 with a stale version", "u1", version - 1),
+        ("u1 with the current version", "u1", version),
     ]:
         try:
             saved = await plan.add_activity("t1", user_id, expected_version, extra)
@@ -186,18 +186,18 @@ async def main() -> None:
         except (PermissionDenied, VersionConflict) as err:
             log("demo", f"{label}: {type(err).__name__}: {err}")
 
-    section("Vault: аудит и TTL")
+    section("Vault: audit and TTL")
     for record in vault.audit_log:
-        log("vault", f"{hhmm(record.at)}Z {record.ref} {record.actor} «{record.purpose}» {'выдано' if record.granted else 'отказано'}")
+        log("vault", f"{hhmm(record.at)}Z {record.ref} {record.actor} «{record.purpose}» {'granted' if record.granted else 'denied'}")
 
     clock.now = trip_end + timedelta(days=8)
     try:
-        vault.read(ref_u1, actor="demo", purpose="после конца поездки")
+        vault.read(ref_u1, actor="demo", purpose="after trip end")
     except VaultAccessDenied as err:
         log("vault", f"VaultAccessDenied: {err}")
 
-    section("DLQ шины")
-    print(f"необработанных событий: {len(bus.dead_letters)}")
+    section("bus DLQ")
+    print(f"unprocessed events: {len(bus.dead_letters)}")
 
 if __name__ == "__main__":
     asyncio.run(main())

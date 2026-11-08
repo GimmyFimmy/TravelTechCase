@@ -58,7 +58,7 @@ class EventBus:
         the event: the outer publish drains the queue, so the outermost `await publish`
         completes when the whole chain of events is processed.
         """
-        if f"{topic}|{key}" in self.__seen: return log("bus", f"дубль {topic} [{key}] отброшен")
+        if f"{topic}|{key}" in self.__seen: return log("bus", f"duplicate {topic} [{key}] dropped")
         self.__seen.add(f"{topic}|{key}")
 
         self.__queue.append(Event(topic=topic, key=key, payload=payload, at=self.__clock()))
@@ -83,7 +83,7 @@ class EventBus:
                 except Exception as err:
                     if attempt >= self.max_attempts:
                         self.dead_letters.append(DeadLetter(event=event, handler=name, error=err, attempts=attempt))
-                        log("bus", f"handler {name} упал {attempt} раз на {event.topic} → DLQ: {err}")
+                        log("bus", f"handler {name} failed {attempt} times on {event.topic} → DLQ: {err}")
                         break
                     # linear backoff, the handlers are idempotent so a retry is safe
                     await asyncio.sleep(self.retry_delay * attempt)

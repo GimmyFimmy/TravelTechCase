@@ -14,7 +14,7 @@ from core.notification_service import notify_participants
 
 class VersionConflict(Exception):
     def __init__(self, trip_id: str, expected: int, actual: int):
-        super().__init__(f"поездка {trip_id} — ожидалась версия {expected}, в базе {actual}")
+        super().__init__(f"trip {trip_id} — expected version {expected}, stored {actual}")
 
 class PermissionDenied(Exception):
     pass
@@ -33,7 +33,7 @@ class TripRepository:
 
     def require(self, trip_id: str) -> Trip:
         trip = self.__store.get(trip_id)
-        if trip is None: raise KeyError(f"поездка {trip_id} не найдена")
+        if trip is None: raise KeyError(f"trip {trip_id} not found")
         return trip
 
     def find_by_segment(self, segment_id: str) -> list[Trip]:
@@ -65,9 +65,9 @@ class TripPlanService:
             try:
                 return self.__trips.save(mutate(current), current.version)
             except VersionConflict as err:
-                log("plan", f"конфликт версий, повтор: {err}")
+                log("plan", f"version conflict, retrying: {err}")
 
-        raise RuntimeError(f"поездка {trip_id}: слишком много конфликтов версий")
+        raise RuntimeError(f"trip {trip_id}: too many version conflicts")
 
     def __with_risk(self, trip: Trip) -> Trip:
         """Items that start after departure but before we arrive are at risk"""
@@ -84,7 +84,7 @@ class TripPlanService:
 
         for trip in self.__trips.find_by_segment(change.segment.id):
             saved = self.__update(trip.id, lambda t: self.__with_risk(t.replace_segment(change.segment)))
-            if saved: await self.__announce(trip, saved, f"рейс {change.segment.flight_no}: {change.segment.status.value}")
+            if saved: await self.__announce(trip, saved, f"flight {change.segment.flight_no}: {change.segment.status.value}")
 
     async def __on_booking_confirmed(self, event: Event) -> None:
         booking: BookingConfirmed = event.payload
@@ -101,7 +101,7 @@ class TripPlanService:
             return self.__with_risk(replace(trip, segments=segments))
 
         saved = self.__update(booking.trip_id, mutate)
-        if saved: await self.__announce(before, saved, f"переоформление: {booking.itinerary.id}, билет {booking.ticket_ref}")
+        if saved: await self.__announce(before, saved, f"rebook: {booking.itinerary.id}, ticket {booking.ticket_ref}")
 
     async def __announce(self, before: Trip, after: Trip, reason: str) -> None:
         """trip.updated, plus a notification if some items have just become at risk"""
@@ -123,8 +123,8 @@ class TripPlanService:
             after,
             f"{after.id}:atrisk:v{after.version}",
             Severity.CRITICAL,
-            f"Под угрозой: {', '.join(fresh)} — начало раньше вашего прилёта ({local_time(after.final_arrive, destination)}). "
-            "Перенесите или отмените.",
+            f"At risk: {', '.join(fresh)} — starts before your arrival ({local_time(after.final_arrive, destination)}). "
+            "Reschedule or cancel.",
         )
 
     async def add_activity(self, trip_id: str, user_id: str, expected_version: int, item: PlanItem) -> Trip:
@@ -132,9 +132,9 @@ class TripPlanService:
         trip = self.__trips.require(trip_id)
         participant = trip.participant_of(user_id)
 
-        if participant is None: raise PermissionDenied(f"{user_id} не участник поездки {trip_id}")
-        if participant.role == Role.VIEWER: raise PermissionDenied(f"{user_id} — viewer, правки запрещены")
+        if participant is None: raise PermissionDenied(f"{user_id} is not a participant of trip {trip_id}")
+        if participant.role == Role.VIEWER: raise PermissionDenied(f"{user_id} is a viewer, edits not allowed")
 
         saved = self.__trips.save(self.__with_risk(replace(trip, items=[*trip.items, item])), expected_version)
-        await self.__announce(trip, saved, f"добавлена активность {item.title}")
+        await self.__announce(trip, saved, f"activity added {item.title}")
         return saved

@@ -95,7 +95,7 @@ class MockBookingGateway(BookingGateway):
         self.__seq += 1
         hold_id = f"HOLD-{self.__seq}"
         self.__hold_by_key[idempotency_key] = hold_id
-        log("booking", f"hold {hold_id} на {itinerary.id} (паспорта: {masked})")
+        log("booking", f"hold {hold_id} for {itinerary.id} (passports: {masked})")
         return hold_id
 
     async def release(self, hold_id: str) -> None:
@@ -103,7 +103,7 @@ class MockBookingGateway(BookingGateway):
 
     async def issue(self, hold_id: str) -> str:
         ticket = f"TKT-{hold_id.split('-')[1]}"
-        log("booking", f"выписан билет {ticket}")
+        log("booking", f"issued ticket {ticket}")
         return ticket
 
     async def cancel(self, ticket_ref: str) -> None:
@@ -122,12 +122,12 @@ class MockPaymentGateway(PaymentGateway):
         if existing: return existing
 
         if any(idempotency_key.endswith(suffix) for suffix in self.decline_suffixes):
-            raise RuntimeError("платёж отклонён банком")
+            raise RuntimeError("payment declined by the bank")
 
         self.__seq += 1
         charge_id = f"CHG-{self.__seq}"
         self.__charge_by_key[idempotency_key] = charge_id
-        log("payment", f"charge {charge_id} на {amount_eur} EUR")
+        log("payment", f"charge {charge_id} for {amount_eur} EUR")
         return charge_id
 
     async def refund(self, charge_id: str) -> None:
@@ -151,17 +151,17 @@ class Saga:
             try:
                 await step.run()
                 done.append(step)
-                log("saga", f"шаг {step.name}: ok")
+                log("saga", f"step {step.name}: ok")
             except Exception as err:
-                log("saga", f"шаг {step.name} упал: {err} — откат")
+                log("saga", f"step {step.name} failed: {err} — rolling back")
 
                 for completed in reversed(done):
                     try:
                         await completed.compensate()
-                        log("saga", f"компенсация {completed.name}: ok")
+                        log("saga", f"compensation {completed.name}: ok")
                     except Exception as compensation_err:
                         # a failed compensation needs a human, in prod it goes to the DLQ
-                        log("saga", f"компенсация {completed.name} не удалась: {compensation_err} — ручной разбор")
+                        log("saga", f"compensation {completed.name} failed: {compensation_err} — manual review")
                 return False
 
         return True
@@ -209,7 +209,7 @@ class RebookingEngine:
 
         log(
             "rebooking",
-            f"кандидатов: {len(candidates)}; нужен вылет из {broken.origin} не раньше {local_time(disruption.not_before, broken.origin)}",
+            f"candidates: {len(candidates)}; need a departure from {broken.origin} no earlier than {local_time(disruption.not_before, broken.origin)}",
         )
 
         # 1. hard filters: a candidate that breaks any of them is dropped, not ranked
@@ -227,7 +227,7 @@ class RebookingEngine:
         if not ranked:
             return await notify_participants(
                 self.__bus, trip, f"{disruption.id}:no-options", Severity.CRITICAL,
-                "Подходящих альтернатив не найдено, нужна помощь поддержки.",
+                "No suitable alternatives found, support help is needed.",
             )
 
         for i, option in enumerate(ranked, start=1):
@@ -236,7 +236,7 @@ class RebookingEngine:
         offers = "\n  ".join(f"{i}) {option.itinerary.describe()}" for i, option in enumerate(ranked[:3], start=1))
         await notify_participants(
             self.__bus, trip, f"{disruption.id}:offers", Severity.CRITICAL,
-            f"Альтернативы для {broken.flight_no}:\n  {offers}",
+            f"Alternatives for {broken.flight_no}:\n  {offers}",
         )
 
         # 3. auto-rebook only within the budget, otherwise the user picks an offer himself
@@ -245,40 +245,40 @@ class RebookingEngine:
         for option in ranked:
             itinerary = option.itinerary
             if itinerary.price_eur > trip.auto_rebook_budget_eur:
-                log("rebooking", f"пропуск {itinerary.id}: {itinerary.price_eur} EUR выше бюджета {trip.auto_rebook_budget_eur} EUR")
+                log("rebooking", f"skip {itinerary.id}: {itinerary.price_eur} EUR over budget {trip.auto_rebook_budget_eur} EUR")
                 continue
             if await self.__rebook(trip, disruption, broken, itinerary): return
 
         await notify_participants(
             self.__bus, trip, f"{disruption.id}:rebook-failed", Severity.CRITICAL,
-            "Автоматически переоформить не удалось, выберите вариант вручную.",
+            "Auto-rebook failed, pick an option manually.",
         )
 
     def __reject_reason(self, trip: Trip, itinerary: Itinerary, disruption: Disruption) -> str | None:
         """Hard filters, the first failed one is the reason. None = the candidate is fine."""
         # baggage: the tariff must cover the strictest participant
         if itinerary.baggage_kg < trip.required_baggage_kg:
-            return f"багаж: тариф {itinerary.baggage_kg} кг, нужно {trip.required_baggage_kg} кг"
+            return f"baggage: tariff {itinerary.baggage_kg} kg, need {trip.required_baggage_kg} kg"
 
         # visas: every transit country must be allowed for every participant
         for code in itinerary.via_airports:
             country = airport_of(code).country
             blocked = [p.user_id for p in trip.participants if country not in p.allowed_countries]
-            if blocked: return f"виза: транзит через {country} ({code}), нет разрешения у {', '.join(blocked)}"
+            if blocked: return f"visa: transit via {country} ({code}), not allowed for {', '.join(blocked)}"
 
         # MCT: the first leg must leave after the earliest possible departure...
         origin = itinerary.segments[0].origin
         if itinerary.depart < disruption.not_before:
             return (
-                f"MCT: вылет {local_time(itinerary.depart, origin)} "
-                f"раньше допустимого {local_time(disruption.not_before, origin)}"
+                f"MCT: departure {local_time(itinerary.depart, origin)} "
+                f"earlier than allowed {local_time(disruption.not_before, origin)}"
             )
 
         # ...and so must every connection inside the offer
         for current, following in zip(itinerary.segments, itinerary.segments[1:]):
             gap = int((following.depart - current.arrive).total_seconds() // 60)
             mct = airport_of(current.destination).mct_minutes
-            if gap < mct: return f"MCT: пересадка в {current.destination} {gap} мин при MCT {mct} мин"
+            if gap < mct: return f"MCT: connection in {current.destination} {gap} min, MCT {mct} min"
 
         return None
 
@@ -291,7 +291,7 @@ class RebookingEngine:
         result = {}
 
         for participant in trip.participants:
-            if participant.passport_ref is None: raise RuntimeError(f"у {participant.user_id} нет passport_ref")
+            if participant.passport_ref is None: raise RuntimeError(f"{participant.user_id} has no passport_ref")
             result[participant.user_id] = self.__vault.read(
                 participant.passport_ref, actor="rebooking-saga", purpose=f"rebook {purpose_key}",
             )
@@ -305,7 +305,7 @@ class RebookingEngine:
         charge_id: str | None = None
         ticket_ref: str | None = None
 
-        log("rebooking", f"автопереоформление {broken.flight_no} → {itinerary.id}")
+        log("rebooking", f"auto-rebook {broken.flight_no} → {itinerary.id}")
 
         async def hold() -> None:
             nonlocal hold_id
@@ -323,7 +323,7 @@ class RebookingEngine:
 
         async def issue() -> None:
             nonlocal ticket_ref
-            if hold_id is None: raise RuntimeError("нет hold для выписки")
+            if hold_id is None: raise RuntimeError("no hold to issue")
             ticket_ref = await self.__booking.issue(hold_id)
 
         async def cancel() -> None:
@@ -350,6 +350,6 @@ class RebookingEngine:
         )
         await notify_participants(
             self.__bus, trip, f"{disruption.id}:rebooked", Severity.INFO,
-            f"Билеты переоформлены: {itinerary.describe()}. Билет {ticket}.",
+            f"Tickets rebooked: {itinerary.describe()}. Ticket {ticket}.",
         )
         return True

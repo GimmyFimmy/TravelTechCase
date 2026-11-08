@@ -47,10 +47,10 @@ class MockChannel(NotificationChannel):
 
     async def send(self, notification: Notification) -> DeliveryResult:
         if notification.user_id in self.offline_users:
-            log(self.kind.value, f"→ {notification.user_id}: устройство оффлайн")
+            log(self.kind.value, f"→ {notification.user_id}: device offline")
             return DeliveryResult.OFFLINE
         if notification.user_id in self.failing_users:
-            log(self.kind.value, f"→ {notification.user_id}: ошибка отправки")
+            log(self.kind.value, f"→ {notification.user_id}: send failed")
             return DeliveryResult.FAILED
 
         log(self.kind.value, f"→ {notification.user_id} [{notification.severity.value}] {notification.text}")
@@ -92,7 +92,7 @@ class NotificationService:
 
     async def __on_requested(self, event: Event) -> None:
         request: NotificationRequest = event.payload
-        if request.key in self.__processed: return log("notify", f"повтор {request.key} пропущен")
+        if request.key in self.__processed: return log("notify", f"duplicate {request.key} skipped")
         self.__processed.add(request.key)
 
         notification = Notification(
@@ -148,7 +148,7 @@ class DeviceCache:
 
         for queued in result.items:
             self.cache[queued.notification.id] = queued.notification
-            log(f"device:{self.user_id}", f"из очереди: {queued.notification.text}")
+            log(f"device:{self.user_id}", f"from queue: {queued.notification.text}")
 
         self.cursor = result.cursor
-        log(f"device:{self.user_id}", f"sync: получено {len(result.items)}, cursor={self.cursor}, в кэше {len(self.cache)}")
+        log(f"device:{self.user_id}", f"sync: got {len(result.items)}, cursor={self.cursor}, cached {len(self.cache)}")

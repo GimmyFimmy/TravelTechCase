@@ -11,7 +11,7 @@ from core.models import log
 
 class VaultAccessDenied(Exception):
     def __init__(self, ref: str):
-        super().__init__(f"нет данных по {ref} (не найдено или срок хранения истёк)")
+        super().__init__(f"no data for {ref} (not found or retention expired)")
 
 @dataclass(frozen=True)
 class _VaultEntry:
@@ -68,5 +68,5 @@ class VaultService:
         for ref in expired:
             del self.__entries[ref]
 
-        if expired: log("vault", f"удалено по TTL: {len(expired)}")
+        if expired: log("vault", f"purged by TTL: {len(expired)}")
         return len(expired)
