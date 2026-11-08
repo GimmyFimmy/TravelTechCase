@@ -1,106 +1,146 @@
-# travel_tech_case
+<h1 align="center">travel_tech_case</h1>
 
-Отслеживание рейсов и авто-ремаршрутизация для сервиса планирования путешествий. Python 3.10+, `asyncio`, только stdlib, всё в памяти.
+<p align="center"><em>Flight tracking and auto-rebooking for a travel planning service</em></p>
 
-```
-python main.py                  # сценарий A: задержка ломает стыковку 60 мин
-python main.py --fail-payment   # то же, но лучший вариант отклонён банком → компенсация саги
-```
+<div align="center">
 
-Установка не нужна. Для `pip install -e .` есть `pyproject.toml`.
+[![Documentation](https://img.shields.io/badge/docs-online-4ade80?style=flat-square)](https://example.com/travel_tech_case/docs/)
+[![Python](https://img.shields.io/badge/language-Python-60a5fa?style=flat-square)]()
+[![asyncio](https://img.shields.io/badge/runtime-asyncio-f87171?style=flat-square)]()
+[![stdlib](https://img.shields.io/badge/deps-stdlib%20only-a87ef5?style=flat-square)]()
 
-## Архитектура
+</div>
 
-Сервисы не знают друг о друге и общаются только через Event Bus (топики `flight.status.changed`, `trip.disrupted`, `trip.updated`, `notif.requested`, `booking.confirmed`). Tracker превращает ответы провайдеров в нормализованные статусы с `confidence` и отсекает дубли. RulesEngine на подтверждённом статусе проверяет стыковки по MCT и публикует `trip.disrupted`. RebookingEngine применяет жёсткие фильтры (багаж, визы, MCT), ранжирует остаток и переоформляет лучший вариант сагой `hold → charge → issue` с компенсациями. TripPlanService обновляет общий план с оптимистичной блокировкой и ролями. NotificationService идемпотентно идёт по цепочке push → email → SMS и копит оффлайн-очередь с sync-cursor. Паспорта лежат только в Vault: наружу уходит `passport_ref`, каждое чтение попадает в аудит, TTL = конец поездки + 7 дней.
+---
 
-```
- внешние API ──► FlightTracker ──flight.status.changed──┬─► TripPlanService ──trip.updated──► (клиенты)
- (breaker+retry,  adapter,       (confidence, dedup)    │        ▲   (roles, version)
-  fallback, DLQ)  normalize                             │        │ booking.confirmed
-                                                        └─► RulesEngine ──trip.disrupted──► RebookingEngine
-                                                             (MCT)                          │ фильтры → ранжирование
-                                                                                            │ saga: hold→charge→issue
-        NotificationService ◄──────────── notif.requested ◄─────────────────────────────────┤  (compensate)
-        push→email→SMS, idempotent,                                                         ▼
-        offline queue + cursor                                                       VaultService (passport_ref,
-                                                                                      TTL, audit) / Booking / Payment
+A demo of the full flow: track flights, detect disruptions, find alternatives, rebook via a saga, keep the shared trip plan up to date, notify users, and protect passport data in a vault. Everything is in memory, no external services.
+
+```bash
+python main.py                  # scenario A: a delay breaks a 60 min connection
+python main.py --fail-payment   # same, but the best offer is declined by the bank → saga compensation
 ```
 
-## Структура
+No installation needed. `pyproject.toml` exists for `pip install -e .` (`import core`).
+
+---
+
+## Architecture
+
+Services do not know about each other; they talk only through the Event Bus (topics `flight.status.changed`, `trip.disrupted`, `trip.updated`, `notif.requested`, `booking.confirmed`).
+
+- **Tracker** turns provider responses into normalized statuses with `confidence` and drops duplicates.
+- **RulesEngine** checks connections against MCT on a confirmed status and publishes `trip.disrupted`.
+- **RebookingEngine** applies hard filters (baggage, visas, MCT), ranks the rest, and rebooks the best option via the saga `hold → charge → issue` with compensations.
+- **TripPlanService** keeps the shared plan up to date with optimistic locking and roles.
+- **NotificationService** goes idempotently through push → email → SMS and accumulates an offline queue with a sync cursor.
+- **Vault** stores passports only. Only `passport_ref` goes outside; every read is audited; TTL = end of trip + 7 days.
+
+---
+
+## Structure
 
 ```
 travel_tech_case/
 ├── pyproject.toml
 ├── README.md
-├── main.py                          демо сценария A (+ оффлайн, отказ API, роли, Vault)
-└── travel_tech_case/
+├── main.py                          demo of scenario A (+ offline, API failure, roles, Vault)
+└── core/
     ├── __init__.py
-    ├── models.py                    модели, аэропорты (MCT, таймзона), payload'ы событий
-    ├── event_bus.py                 шина: топики, идемпотентный publish, retry, DLQ
+    ├── models.py                    models, airports (MCT, TZ), event payloads
+    ├── event_bus.py                 bus: topics, idempotent publish, retry, DLQ
     ├── circuit_breaker.py           CircuitBreaker + retry_with_backoff
     ├── flight_tracker.py            FlightAdapter, MockFlightAdapter, FlightTrackerService
-    ├── rules_engine.py              детект отмены и сломанной стыковки
-    ├── notification_service.py      цепочка каналов, оффлайн-очередь, sync-cursor, DeviceCache
-    ├── rebooking_engine.py          поиск, фильтры, ранжирование, сага, моки
-    ├── trip_plan_service.py         TripRepository (version), TripPlanService (роли)
-    └── vault.py                     хранилище паспортов с TTL и аудитом
+    ├── rules_engine.py              cancellation and broken-connection detection
+    ├── notification_service.py      channel chain, offline queue, sync cursor, DeviceCache
+    ├── rebooking_engine.py          search, filters, ranking, saga, mocks
+    ├── trip_plan_service.py         TripRepository (version), TripPlanService (roles)
+    └── vault.py                     passport store with TTL and audit
 ```
 
-## Что покажет демо
+---
 
-1. План: SVO → IST (TK412) → BCN (TK1855), пересадка 60 мин, MCT в IST 45 мин.
-2. `poll 1`: первый запрос падает по таймауту, retry получает рассылку «задержка 50 мин» (`confidence=low`). Это мягкое info-уведомление, план и деньги не трогаем.
-3. `poll 2`: API подтверждает задержку (`confidence=high`). Пересадка 10 мин < 45 мин, значит дистрапшн. Из 6 кандидатов отсеиваются TK1857 (вылет раньше допустимого по MCT), PC1272 (тариф без багажа) и BA675+BA478 (транзит через GB без визы). Остаются TK1859, TK1861 и IB3201+IB1234. Лучший (TK1859) переоформляется автоматически, план обновляется, «Sagrada Família» помечается «под угрозой».
-4. `poll 3`: тот же статус от API отбрасывается как дубликат.
-5. `poll 4`: API недоступно, после 3 ошибок breaker открывается, tracker остаётся на последнем известном статусе, опросы уходят в DLQ.
-6. u2 (viewer) оффлайн: push копится в очереди, критичное дублируется на email, при `sync` клиент получает всё по cursor. Viewer не может править план, устаревшая версия отклоняется. Аудит чтений паспортов виден, после TTL чтение отказано.
+## What the demo shows
 
-С `--fail-payment` платёж за TK1859 отклоняется: сага снимает hold (компенсация) и переходит к следующему варианту, TK1861.
+1. Plan: SVO → IST (TK412) → BCN (TK1855), 60 min connection, MCT in IST is 45 min.
+2. `poll 1`: the first request times out, the retry gets a mailing "50 min delay" (`confidence=low`). This is a soft info notification; the plan and the money are not touched.
+3. `poll 2`: the API confirms the delay (`confidence=high`). The 10 min connection is below the 45 min MCT, so it is a disruption. Of 6 candidates, TK1857 (departs before the MCT), PC1272 (no baggage tariff) and BA675+BA478 (GB transit without a visa) are dropped. TK1859, TK1861 and IB3201+IB1234 remain. The best (TK1859) is auto-rebooked, the plan is updated, "Sagrada Família" is marked "at risk".
+4. `poll 3`: the same status from the API is dropped as a duplicate.
+5. `poll 4`: the API is down; after 3 errors the breaker opens, the tracker stays on the last known status, polls go to the DLQ.
+6. u2 (viewer) goes offline: push is queued, critical messages are also sent to email; on `sync` the client receives everything by cursor. A viewer cannot edit the plan; a stale version is rejected. Vault read audit is visible, reads are denied after TTL.
 
-Время хранится и сравнивается в UTC (`datetime` с `tzinfo=utc`), в сообщениях печатается местное время аэропорта.
+With `--fail-payment`, the payment for TK1859 is declined: the saga releases the hold (compensation) and moves to the next option, TK1861.
 
-## Ограничение → Решение
+Time is stored and compared in UTC (`datetime` with `tzinfo=utc`); local airport time is used only in messages.
 
-| Ограничение | Как учтено в коде |
+---
+
+## Constraint → Solution
+
+| Constraint | How the code handles it |
 |---|---|
-| Данные приходят с задержкой, нужны confidence и дедупликация | `flight_tracker.py`: источник `MAILING` → `LOW`, `API` → `HIGH`. Дубль по `fingerprint` (статус + задержка) отбрасывается, кроме повышения доверия low → high. Наблюдение старше уже принятого (`observed_at`) игнорируется. `event_bus.py`: ключ события не доставляется дважды. Low-статус не пишется в план и не запускает ремаршрутизацию. |
-| Пользователь может быть оффлайн | `notification_service.py`: push → `OFFLINE` кладёт сообщение в очередь, `INFO` на этом заканчивается, `CRITICAL` идёт дальше на email и SMS. `sync(user_id, cursor)` отдаёт пропущенное, `DeviceCache` хранит cursor и локальный кэш и дедуплицирует по id. |
-| Багаж, визы, таймзоны | `rebooking_engine.py` `__reject_reason`: тариф ≥ требуемому багажу самого строгого участника, транзитные страны разрешены каждому участнику, вылет не раньше «прилёт + MCT» и MCT внутри самого варианта. Всё время в UTC, местное только для текстов (`local_time`). |
-| Паспорта не хранить дольше необходимого | `vault.py`: TTL = конец поездки + 7 дней, `purge_expired()`, снаружи только `passport_ref`, любое чтение пишется в аудит (в том числе отказ), аудит не содержит данных паспорта. Сага читает паспорта только на шаге `hold`, шлюз в логах маскирует номер. |
-| Внешние API ненадёжны | `circuit_breaker.py`: closed → open → half-open, `retry_with_backoff` с экспоненциальной паузой. Tracker и поиск работают через них. Fallback: последний известный статус. DLQ: опросы (`FailedPoll`) и события (`bus.dead_letters`). Сага компенсирует шаги в обратном порядке. |
-| Многопользовательский режим | `models.py`: роли `OWNER/EDITOR/VIEWER` в `participants`. `trip_plan_service.py`: `save(trip, expected_version)` бросает `VersionConflict`, фоновые обновления делают read-modify-write с 3 повторами, пользовательские правки проверяют роль и версию. |
+| Data arrives late; confidence and dedup needed | `flight_tracker.py`: source `MAILING` → `LOW`, `API` → `HIGH`. A duplicate by `fingerprint` (status + delay) is dropped, except a confidence upgrade low → high. An observation older than the accepted one (`observed_at`) is ignored. `event_bus.py`: an event key is never delivered twice. A low status is not written to the plan and does not start rebooking. |
+| The user may be offline | `notification_service.py`: push → `OFFLINE` puts the message in a queue, `INFO` stops there, `CRITICAL` continues to email and SMS. `sync(user_id, cursor)` returns what was missed; `DeviceCache` keeps the cursor and local cache and dedups by id. |
+| Baggage, visas, time zones | `rebooking_engine.py` `__reject_reason`: tariff ≥ the strictest participant's baggage, transit countries allowed for every participant, departure not before "arrival + MCT" and MCT inside the offer. All time in UTC, local only for texts (`local_time`). |
+| Do not keep passports longer than needed | `vault.py`: TTL = end of trip + 7 days, `purge_expired()`, only `passport_ref` goes outside, every read (including a denial) is audited, audit contains no passport data. The saga reads passports only on the `hold` step; the gateway masks the number in logs. |
+| External APIs are unreliable | `circuit_breaker.py`: closed → open → half-open, `retry_with_backoff` with exponential pause. Tracker and search go through them. Fallback: last known status. DLQ: polls (`FailedPoll`) and events (`bus.dead_letters`). The saga compensates steps in reverse. |
+| Multi-user mode | `models.py`: roles `OWNER/EDITOR/VIEWER` in `participants`. `trip_plan_service.py`: `save(trip, expected_version)` raises `VersionConflict`, background updates do read-modify-write with 3 retries, user edits check role and version. |
 
-Паттерны: adapter (`FlightAdapter`, шлюзы), saga (`Saga`, `SagaStep`), outbox/idempotency (ключи событий, уведомлений, hold и charge), circuit breaker, optimistic locking.
+Patterns: adapter (`FlightAdapter`, gateways), saga (`Saga`, `SagaStep`), outbox/idempotency (event, notification, hold, and charge keys), circuit breaker, optimistic locking.
 
-## Что заменить в проде
+---
 
-| Сейчас (in-memory) | В проде | Зачем |
+## What to replace in prod
+
+| Now (in-memory) | In prod | Why |
 |---|---|---|
-| `EventBus` | Kafka (топики те же, ключ партиции = `trip_id`) | персистентность, порядок внутри поездки, повторная обработка |
-| Идемпотентность и outbox в `set` | transactional outbox в PostgreSQL + таблица `processed_events` | событие и изменение данных в одной транзакции |
-| `TripRepository` | PostgreSQL: `trips`, `trip_participants`, колонка `version` | `UPDATE ... WHERE version = ?` |
-| Очередь оффлайн-уведомлений и cursor | PostgreSQL или Redis Streams с TTL | переживает рестарт, cursor — позиция в потоке |
-| `__known` в tracker и состояние breaker | Redis | общее состояние между инстансами |
-| `VaultService` | KMS/HSM + зашифрованное хранилище, TTL-джоба, аудит в append-only лог | шифрование, ротация ключей, неизменяемый аудит |
-| `DeadLetter`, `FailedPoll` | DLQ-топик Kafka + алерты | ручной разбор и повторная отправка |
-| Mock-адаптеры, поиск, шлюзы | реальные API авиакомпаний, GDS, платёжный провайдер | замена за интерфейсами (ABC) без правки ядра |
-| Опрос `poll()` | воркеры по расписанию + вебхуки провайдеров | не тратить квоту и снизить задержку |
+| `EventBus` | Kafka (same topics, partition key = `trip_id`) | persistence, per-trip order, replay |
+| Idempotency and outbox in `set` | transactional outbox in PostgreSQL + `processed_events` table | event and data change in one transaction |
+| `TripRepository` | PostgreSQL: `trips`, `trip_participants`, `version` column | `UPDATE ... WHERE version = ?` |
+| Offline notification queue and cursor | PostgreSQL or Redis Streams with TTL | survives restart, cursor = position in the stream |
+| `__known` in tracker and breaker state | Redis | shared state between instances |
+| `VaultService` | KMS/HSM + encrypted store, TTL job, audit in append-only log | encryption, key rotation, immutable audit |
+| `DeadLetter`, `FailedPoll` | Kafka DLQ topic + alerts | manual triage and replay |
+| Mock adapters, search, gateways | real airline APIs, GDS, payment provider | replaced behind `ABC` interfaces without touching the core |
+| `poll()` | scheduled workers + provider webhooks | do not waste quota, reduce latency |
 
-## Решения по умолчанию
+---
 
-- Низкое доверие (`LOW`) даёт только info-уведомление. Дистрапшн, план и переоформление включаются от `HIGH`.
-- Автопереоформление работает только при `auto_rebook_budget_eur > 0` и цене варианта в бюджете (в демо 400 EUR). По умолчанию 0: только предложения.
-- Цена (`price_eur`) — на всю группу, багаж — на пассажира. Транзит проверяется для всех участников.
-- Ранжирование: балл = минуты дополнительного опоздания + 0.5 × EUR + 90 × пересадки, меньше — лучше.
-- MCT и таймзоны аэропортов — демо-значения в `models.py`, неизвестный аэропорт: MCT 90 мин, UTC+0.
-- Визы и страны вымышлены для демо и не являются юридической справкой.
-- Задержка меньше 15 минут уведомления не вызывает.
-- Если активность стартует после вылета, но раньше прилёта, она помечается «под угрозой» и участникам уходит уведомление.
-- Приватные методы и атрибуты классов с префиксом `__`, как в snitch.
+## Defaults
 
-## 3 тезиса для защиты
+- Low confidence (`LOW`) produces an info notification only. Disruption, plan update and rebooking require `HIGH`.
+- Auto-rebook works only when `auto_rebook_budget_eur > 0` and the option's price is within budget (400 EUR in the demo). Default is 0: offers only.
+- Price (`price_eur`) is for the whole party; baggage is per passenger. Transit is checked for every participant.
+- Ranking: score = minutes of extra delay + 0.5 × EUR + 90 × stops, lower is better.
+- MCT and airport time zones are demo values in `models.py`; an unknown airport gets MCT 90 min, UTC+0.
+- Visas and countries are fictional for the demo and are not legal advice.
+- A delay shorter than 15 minutes does not trigger a notification.
+- If an activity starts after departure but before arrival, it is marked "at risk" and participants are notified.
+- Private methods and attributes use the `__` prefix, same as in snitch.
 
-1. **Не доверяем первому слуху и не тратим деньги на него.** Каждый статус несёт `confidence` и время наблюдения, дубли и устаревшие данные отсекаются, а ремаршрутизация и платежи запускаются только от подтверждённых данных.
-2. **Каждый побочный эффект идемпотентен и обратим.** Ключи события, уведомления, hold и charge защищают от двойной обработки, а сага откатывает уже сделанное в обратном порядке: пользователя не списывают дважды и не оставляют с «подвешенным» бронированием.
-3. **Минимум данных и минимум доверия к внешнему миру.** Паспорта живут в Vault только до конца поездки + grace и отдаются по ссылке с аудитом, а сбои API локализованы breaker'ом, retry, fallback на последний известный статус и DLQ.
-# TravelTechCase
+---
+
+## Three theses
+
+1. **Do not trust the first rumour, do not spend money on it.** Every status carries `confidence` and observation time, duplicates and stale data are dropped, and rebooking and payments start only from confirmed data.
+2. **Every side effect is idempotent and reversible.** Event, notification, hold and charge keys prevent double processing, and the saga rolls back what was already done in reverse: the user is not charged twice and is not left with a dangling booking.
+3. **Minimum data and minimum trust in the outside world.** Passports live in the Vault only until the end of the trip + grace and are handed out by reference with an audit, and API failures are localized by a breaker, retry, fallback to the last known status, and a DLQ.
+
+---
+
+## Contributing
+
+Contributions are welcome — open an issue or PR.
+
+- **Keep it small.** This is a demo, not a platform. New behavior should be reachable from `main.py` and fit in one file under `core/`.
+- **Match the style.** `__` for private members, one class per responsibility, no imports outside stdlib.
+- **One thing per PR.** Focused PRs merge faster.
+
+If you're unsure whether an idea fits, open an issue first.
+
+---
+
+<p align="center"><sub>
+<a href="https://example.com/travel_tech_case/docs/">Docs</a> ·
+<a href="https://github.com/example/travel_tech_case/issues">Issues</a> ·
+<a href="https://github.com/example/travel_tech_case/releases">Releases</a>
+</sub></p>
